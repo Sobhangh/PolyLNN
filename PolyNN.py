@@ -1,10 +1,48 @@
 import math
+from pathlib import Path
 from typing import Iterable, List, Optional
+import warnings
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+
+
+_POLYCONV_CUDA_EXT = None
+_POLYCONV_CUDA_EXT_LOAD_ATTEMPTED = False
+
+
+def _get_polyconv_cuda_ext():
+    global _POLYCONV_CUDA_EXT
+    global _POLYCONV_CUDA_EXT_LOAD_ATTEMPTED
+
+    if _POLYCONV_CUDA_EXT_LOAD_ATTEMPTED:
+        return _POLYCONV_CUDA_EXT
+    _POLYCONV_CUDA_EXT_LOAD_ATTEMPTED = True
+
+    if not torch.cuda.is_available():
+        return None
+
+    ext_dir = Path(__file__).resolve().parent / "cuda_kernels"
+    cpp_file = ext_dir / "polyconv_ext.cpp"
+    cu_file = ext_dir / "polyconv_ext_kernel.cu"
+    if not cpp_file.exists() or not cu_file.exists():
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+
+        _POLYCONV_CUDA_EXT = load(
+            name="polyconv_cuda_ext",
+            sources=[str(cpp_file), str(cu_file)],
+            verbose=False,
+        )
+    except Exception as exc:
+        warnings.warn(f"polyconv_cuda_ext build failed, falling back to PyTorch ops: {exc}")
+        _POLYCONV_CUDA_EXT = None
+
+    return _POLYCONV_CUDA_EXT
 
 
 # TODO: Convolutional architecture: possibly with Trees similar to Conv DLGN.
@@ -369,8 +407,55 @@ class FullPolyConv2d(nn.Module):
         return out
 
     def _forward_cuda_kernel(self, x: torch.Tensor) -> torch.Tensor:
-        # Uses batched tensor indexing/gather ops that dispatch to CUDA kernels.
-        return self._forward_vectorized(x)
+        ext = _get_polyconv_cuda_ext()
+        if ext is None:
+            return self._forward_vectorized(x)
+
+        batch_size, in_channels, height, width = x.shape
+        padded = nn.functional.pad(x, (self.padding, self.padding, self.padding, self.padding))
+        out_h = (height + 2 * self.padding - self.kernel_h) // self.stride + 1
+        out_w = (width + 2 * self.padding - self.kernel_w) // self.stride + 1
+
+        windows = padded.unfold(2, self.kernel_h, self.stride).unfold(3, self.kernel_w, self.stride)
+        windows = windows.permute(0, 2, 3, 1, 4, 5)
+        positions = out_h * out_w
+        flat_windows = windows.reshape(batch_size, positions, in_channels * self.kernel_h * self.kernel_w).contiguous()
+
+        connectivity = self.connectivity.to(x.device)
+        flat_idx = (
+            connectivity[..., 0] * (self.kernel_h * self.kernel_w)
+            + connectivity[..., 1] * self.kernel_w
+            + connectivity[..., 2]
+        ).long().contiguous()
+
+        sampled = ext.gather_windows(flat_windows, flat_idx)
+        # [batch, out_channels, positions, num_leaves, num_inputs_per_leaf]
+
+        selected_weights = self.input_weights.to(x.device).view(
+            1, self.out_channels, 1, self.num_leaves, self.num_inputs_per_leaf
+        )
+        weighted_inputs = sampled * selected_weights
+        monomial_terms = self._all_monomials(weighted_inputs)
+
+        leaf_scores = torch.sum(
+            monomial_terms * self.monomial_coeffs.view(1, self.out_channels, 1, self.num_leaves, -1),
+            dim=-1,
+        )
+        leaf_outputs = self._apply_activation(leaf_scores)
+
+        tree_values = leaf_outputs
+        coeff_offset = 0
+        while tree_values.shape[-1] > 1:
+            num_groups = tree_values.shape[-1] // self.branch_count
+            coeff_block = self.tree_weights[:, coeff_offset: coeff_offset + num_groups, :]
+            grouped = tree_values.reshape(batch_size, self.out_channels, positions, num_groups, self.branch_count)
+            grouped_monomials = self._all_monomials(grouped)
+            coeff = coeff_block.unsqueeze(0).unsqueeze(2)
+            tree_values = torch.sum(grouped_monomials * coeff, dim=-1)
+            coeff_offset += num_groups
+
+        out = self._apply_activation(tree_values.squeeze(-1)).reshape(batch_size, self.out_channels, out_h, out_w)
+        return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 4:
@@ -631,6 +716,7 @@ class ConvPolyNetwork(nn.Module):
                     branch_count=self.branch_count,
                     depth=self.conv_depth,
                     activation=self.hidden_activation,
+                    group_size=4,
                     max_selected_features=self.max_selected_features,
                 )
             )
@@ -641,7 +727,7 @@ class ConvPolyNetwork(nn.Module):
         self.final_spatial_size = current_size
         self.final_channels = current_channels
         self.flattened_dim = self.final_channels * self.final_spatial_size * self.final_spatial_size
-        self.hidden_width = max(2, self.flattened_dim // 2)
+        self.hidden_width = max(2, self.flattened_dim // 4)
 
         self.poly_fc1 = FullPolyLayer(
             in_features=self.flattened_dim,
@@ -775,7 +861,7 @@ class ExampleTrainer:
 
     @staticmethod
     def run_cifar10_conv_demo(
-        k: int = 8,
+        k: int = 4,
         epochs: int = 20,
         batch_size: int = 64,
         train_limit: Optional[int] = None,
