@@ -215,6 +215,7 @@ class FullPolyConv2d(nn.Module):
         group_size: int = 1,
         group_mode: str = "ordered",
         activation: str = "sigmoid",
+        max_selected_features: int = 8,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -228,6 +229,7 @@ class FullPolyConv2d(nn.Module):
         self.group_size = max(1, int(group_size))
         self.group_mode = group_mode
         self.activation_name = activation or "sigmoid"
+        self.max_selected_features = max(1, int(max_selected_features))
 
         if self.branch_count <= 1:
             raise ValueError("branch_count must be >= 2")
@@ -238,7 +240,11 @@ class FullPolyConv2d(nn.Module):
         self.num_leaves = self.branch_count ** self.depth
         self.num_window_positions = self.kernel_h * self.kernel_w
         self.num_inputs_per_leaf = max(1, int(round(self.input_percent * self.in_channels * self.num_window_positions)))
-        self.num_inputs_per_leaf = min(self.num_inputs_per_leaf, self.in_channels * self.num_window_positions)
+        self.num_inputs_per_leaf = min(
+            self.num_inputs_per_leaf,
+            self.in_channels * self.num_window_positions,
+            self.max_selected_features,
+        )
 
         self.num_internal_nodes = 0
         remaining = self.num_leaves
@@ -249,7 +255,6 @@ class FullPolyConv2d(nn.Module):
         self.input_weights = nn.Parameter(torch.empty(self.out_channels, self.num_leaves, self.num_inputs_per_leaf))
         self.monomial_coeffs = nn.Parameter(torch.empty(self.out_channels, self.num_leaves, 2 ** self.num_inputs_per_leaf))
         self.tree_weights = nn.Parameter(torch.empty(self.out_channels, self.num_internal_nodes, 2 ** self.branch_count))
-        self.bias = nn.Parameter(torch.zeros(self.out_channels))
 
         self.register_buffer(
             "connectivity",
@@ -266,7 +271,6 @@ class FullPolyConv2d(nn.Module):
         nn.init.normal_(self.input_weights, mean=0.0, std=0.5)
         nn.init.normal_(self.monomial_coeffs, mean=0.0, std=0.8)
         nn.init.normal_(self.tree_weights, mean=0.0, std=0.1)
-        self.bias.data.zero_()
 
         num_groups = max(1, int(math.ceil(self.in_channels / self.group_size)))
         if self.group_mode == "random":
@@ -283,14 +287,17 @@ class FullPolyConv2d(nn.Module):
             if len(allowed_channel_ids) == 0:
                 allowed_channel_ids = list(range(self.in_channels))
 
+            allowed_channels_tensor = torch.tensor(allowed_channel_ids, dtype=torch.long)
             for leaf in range(self.num_leaves):
+                random_channel_choices = allowed_channels_tensor[
+                    torch.randint(0, len(allowed_channel_ids), (self.num_inputs_per_leaf,))
+                ]
+                random_x = torch.randint(0, self.kernel_w, (self.num_inputs_per_leaf,), dtype=torch.long)
+                random_y = torch.randint(0, self.kernel_h, (self.num_inputs_per_leaf,), dtype=torch.long)
                 for inp in range(self.num_inputs_per_leaf):
-                    channel = allowed_channel_ids[(leaf * inp + k) % len(allowed_channel_ids)]
-                    x = (leaf + k + inp) % self.kernel_w
-                    y = (leaf + k + inp + channel) % self.kernel_h
-                    self.connectivity[k, leaf, inp, 0] = channel
-                    self.connectivity[k, leaf, inp, 1] = x
-                    self.connectivity[k, leaf, inp, 2] = y
+                    self.connectivity[k, leaf, inp, 0] = random_channel_choices[inp]
+                    self.connectivity[k, leaf, inp, 1] = random_x[inp]
+                    self.connectivity[k, leaf, inp, 2] = random_y[inp]
 
     @staticmethod
     def _all_monomials(weighted_inputs: torch.Tensor) -> torch.Tensor:
@@ -342,7 +349,7 @@ class FullPolyConv2d(nn.Module):
         leaf_scores = torch.sum(
             monomial_terms * self.monomial_coeffs.view(1, self.out_channels, 1, self.num_leaves, -1),
             dim=-1,
-        ) + self.bias.view(1, self.out_channels, 1, 1)
+        )
         leaf_outputs = self._apply_activation(leaf_scores)
 
         tree_values = leaf_outputs
@@ -539,6 +546,128 @@ class FullPolyNetwork(nn.Module):
         return total
 
 
+class ConvPolyNetwork(nn.Module):
+    """Convolutional PolyNN for CIFAR-10 using FullPolyConv2d blocks."""
+
+    def __init__(
+        self,
+        k: int = 8,
+        input_size: int = 32,
+        in_channels: int = 3,
+        num_classes: int = 10,
+        input_percent: float = 0.2,
+        branch_count: int = 2,
+        conv_depth: int = 2,
+        hidden_activation: str = "sigmoid",
+        output_activation: str = "softmax",
+        l1_lambda: float = 1e-5,
+        max_selected_features: int = 8,
+    ):
+        super().__init__()
+        self.k = int(k)
+        self.input_size = int(input_size)
+        self.in_channels = int(in_channels)
+        self.num_classes = int(num_classes)
+        self.input_percent = _normalize_percent(input_percent)
+        self.branch_count = int(branch_count)
+        self.conv_depth = int(conv_depth)
+        self.hidden_activation = hidden_activation
+        self.output_activation = output_activation
+        self.l1_lambda = float(l1_lambda)
+        self.max_selected_features = max(1, int(max_selected_features))
+
+        conv_layers: List[nn.Module] = []
+        current_channels = self.in_channels
+        current_size = self.input_size
+        out_channels = self.k
+
+        # First layer: receptive field 4, stride 1, depth 2.
+        conv_layers.append(
+            FullPolyConv2d(
+                in_channels=current_channels,
+                out_channels=out_channels,
+                kernel_size=4,
+                stride=1,
+                padding=0,
+                input_percent=self.input_percent,
+                branch_count=self.branch_count,
+                depth=self.conv_depth,
+                activation=self.hidden_activation,
+                max_selected_features=self.max_selected_features,
+            )
+        )
+        current_size = (current_size - 4) // 1 + 1
+        current_channels = out_channels
+
+        # Subsequent layers: receptive field 3, stride 2, channel doubling.
+        while current_size > 2:
+            out_channels = current_channels * 2
+            conv_layers.append(
+                FullPolyConv2d(
+                    in_channels=current_channels,
+                    out_channels=out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=0,
+                    input_percent=self.input_percent,
+                    branch_count=self.branch_count,
+                    depth=self.conv_depth,
+                    activation=self.hidden_activation,
+                    max_selected_features=self.max_selected_features,
+                )
+            )
+            current_size = (current_size - 3) // 2 + 1
+            current_channels = out_channels
+
+        self.conv_layers = nn.ModuleList(conv_layers)
+        self.final_spatial_size = current_size
+        self.final_channels = current_channels
+        self.flattened_dim = self.final_channels * self.final_spatial_size * self.final_spatial_size
+        self.hidden_width = max(2, self.flattened_dim // 2)
+
+        self.poly_fc1 = FullPolyLayer(
+            in_features=self.flattened_dim,
+            out_features=self.hidden_width,
+            input_percent=self.input_percent,
+            activation=self.hidden_activation,
+            max_selected_features=self.max_selected_features,
+        )
+        self.poly_fc2 = FullPolyLayer(
+            in_features=self.hidden_width,
+            out_features=self.hidden_width,
+            input_percent=self.input_percent,
+            activation=self.hidden_activation,
+            max_selected_features=self.max_selected_features,
+        )
+        self.output_head = nn.Linear(self.hidden_width, self.num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for conv in self.conv_layers:
+            x = conv(x)
+        x = x.reshape(x.size(0), -1)
+        x = self.poly_fc1(x)
+        x = self.poly_fc2(x)
+        logits = self.output_head(x)
+
+        if self.output_activation == "sigmoid":
+            return torch.sigmoid(logits)
+        if self.output_activation == "softmax":
+            return torch.softmax(logits, dim=-1)
+        if self.output_activation == "identity":
+            return logits
+        if self.output_activation == "tanh":
+            return torch.tanh(logits)
+        raise ValueError(f"Unsupported output activation: {self.output_activation}")
+
+    def regularization_loss(self) -> torch.Tensor:
+        total = torch.tensor(0.0, device=next(self.parameters()).device)
+        for conv in self.conv_layers:
+            total = total + conv.l1_regularization(self.l1_lambda)
+        total = total + self.poly_fc1.l1_regularization(self.l1_lambda)
+        total = total + self.poly_fc2.l1_regularization(self.l1_lambda)
+        return total
+
+
 class ExampleTrainer:
     """Train the sparse polynomial network on MNIST."""
 
@@ -551,6 +680,25 @@ class ExampleTrainer:
 
         train_dataset = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
         test_dataset = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+
+        if train_limit is not None:
+            train_dataset = torch.utils.data.Subset(train_dataset, list(range(train_limit)))
+        if test_limit is not None:
+            test_dataset = torch.utils.data.Subset(test_dataset, list(range(test_limit)))
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        return train_loader, test_loader
+
+    @staticmethod
+    def make_cifar10_loaders(batch_size: int = 64, train_limit: Optional[int] = None, test_limit: Optional[int] = None):
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+        ])
+
+        train_dataset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+        test_dataset = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
 
         if train_limit is not None:
             train_dataset = torch.utils.data.Subset(train_dataset, list(range(train_limit)))
@@ -603,6 +751,61 @@ class ExampleTrainer:
 
             print(f"epoch={epoch:02d}  avg_loss={train_loss / max(1, len(train_loader.dataset)):.4f}  test_acc={correct / total}")
 
+    @staticmethod
+    def run_cifar10_conv_demo(
+        k: int = 8,
+        epochs: int = 20,
+        batch_size: int = 64,
+        train_limit: Optional[int] = None,
+        test_limit: Optional[int] = None,
+    ) -> None:
+        train_loader, test_loader = ExampleTrainer.make_cifar10_loaders(
+            batch_size=batch_size,
+            train_limit=train_limit,
+            test_limit=test_limit,
+        )
+
+        model = ConvPolyNetwork(
+            k=k,
+            input_size=32,
+            in_channels=3,
+            num_classes=10,
+            input_percent=0.2,
+            branch_count=2,
+            conv_depth=2,
+            hidden_activation="sigmoid",
+            output_activation="softmax",
+            l1_lambda=1e-5,
+            max_selected_features=8,
+        )
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
+        criterion = nn.NLLLoss()
+
+        for epoch in range(epochs):
+            model.train()
+            train_loss = 0.0
+            for xb, yb in train_loader:
+                optimizer.zero_grad()
+                probs = model(xb)
+                loss = criterion(torch.log(probs.clamp_min(1e-8)), yb) + model.regularization_loss()
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * xb.size(0)
+
+            model.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for xb, yb in test_loader:
+                    preds = model(xb).argmax(dim=1)
+                    correct += (preds == yb).sum().item()
+                    total += yb.size(0)
+
+            avg_loss = train_loss / max(1, len(train_loader.dataset))
+            test_acc = correct / max(1, total)
+            print(f"epoch={epoch:02d}  avg_loss={avg_loss:.4f}  test_acc={test_acc:.4f}")
+
         # model.prune_top_k(top_k=6)
         # print("\nDominant weights after pruning:")
         # for layer_idx, layer in enumerate(model.layers):
@@ -613,4 +816,4 @@ class ExampleTrainer:
 
 
 if __name__ == "__main__":
-    ExampleTrainer.run_demo()
+    ExampleTrainer.run_cifar10_conv_demo()
