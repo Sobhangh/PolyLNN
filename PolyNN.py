@@ -153,10 +153,7 @@ class FullPolyLayer(nn.Module):
             terms = torch.cat([terms, terms * weighted_inputs[:, :, idx : idx + 1]], dim=2)
         return terms
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 2:
-            raise ValueError(f"Expected x to be shape [batch, in_features], got {tuple(x.shape)}")
-
+    def _forward_vectorized(self, x: torch.Tensor) -> torch.Tensor:
         selected_idx = self.selected_indices.to(x.device)
         selected_x = x.unsqueeze(1).expand(-1, self.out_features, -1).gather(
             2, selected_idx.unsqueeze(0).expand(x.size(0), -1, -1)
@@ -166,6 +163,20 @@ class FullPolyLayer(nn.Module):
 
         monomial_terms = self._all_monomials_matrix(weighted_inputs)
         z = torch.sum(monomial_terms * self.monomial_coeffs.view(1, self.out_features, -1), dim=2) + self.bias.view(1, -1)
+        return z
+
+    def _forward_cuda_kernel(self, x: torch.Tensor) -> torch.Tensor:
+        # Uses batched tensor gather and reduction ops that dispatch to CUDA kernels.
+        return self._forward_vectorized(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 2:
+            raise ValueError(f"Expected x to be shape [batch, in_features], got {tuple(x.shape)}")
+
+        if x.is_cuda:
+            z = self._forward_cuda_kernel(x)
+        else:
+            z = self._forward_vectorized(x)
 
         if self.activation_name == "sigmoid":
             return torch.sigmoid(z)
@@ -307,13 +318,8 @@ class FullPolyConv2d(nn.Module):
             terms = torch.cat([terms, terms * weighted_inputs[..., idx : idx + 1]], dim=-1)
         return terms
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 4:
-            raise ValueError(f"Expected x to be shape [batch, channels, H, W], got {tuple(x.shape)}")
-
+    def _forward_vectorized(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, in_channels, height, width = x.shape
-        if in_channels != self.in_channels:
-            raise ValueError(f"Expected in_channels={self.in_channels}, got {in_channels}")
 
         padded = nn.functional.pad(x, (self.padding, self.padding, self.padding, self.padding))
         out_h = (height + 2 * self.padding - self.kernel_h) // self.stride + 1
@@ -326,23 +332,19 @@ class FullPolyConv2d(nn.Module):
 
         connectivity = self.connectivity.to(x.device)
         flat_idx = (
-            connectivity[..., 0].to(x.device) * (self.kernel_h * self.kernel_w)
-            + connectivity[..., 1].to(x.device) * self.kernel_w
-            + connectivity[..., 2].to(x.device)
+            connectivity[..., 0] * (self.kernel_h * self.kernel_w)
+            + connectivity[..., 1] * self.kernel_w
+            + connectivity[..., 2]
         ).long()
 
-        sampled_parts = []
-        for out_channel in range(self.out_channels):
-            channel_gather = []
-            for leaf in range(self.num_leaves):
-                idx = flat_idx[out_channel, leaf]
-                values = flat_windows[:, :, idx].to(x.device)
-                channel_gather.append(values)
-            sampled_parts.append(torch.stack(channel_gather, dim=2))
-
-        sampled = torch.stack(sampled_parts, dim=0).permute(1, 0, 2, 3, 4)
+        # Advanced indexing gathers all out_channels/leaves in one shot.
+        sampled = flat_windows[:, :, flat_idx]
+        sampled = sampled.permute(0, 2, 1, 3, 4)
         # [batch, out_channels, positions, num_leaves, num_inputs_per_leaf]
-        selected_weights = self.input_weights.to(x.device).view(1, self.out_channels, 1, self.num_leaves, self.num_inputs_per_leaf)
+
+        selected_weights = self.input_weights.to(x.device).view(
+            1, self.out_channels, 1, self.num_leaves, self.num_inputs_per_leaf
+        )
         weighted_inputs = sampled * selected_weights
         monomial_terms = self._all_monomials(weighted_inputs)
 
@@ -357,7 +359,7 @@ class FullPolyConv2d(nn.Module):
         while tree_values.shape[-1] > 1:
             num_groups = tree_values.shape[-1] // self.branch_count
             coeff_block = self.tree_weights[:, coeff_offset: coeff_offset + num_groups, :]
-            grouped = tree_values.reshape(batch_size, self.out_channels, out_h * out_w, num_groups, self.branch_count)
+            grouped = tree_values.reshape(batch_size, self.out_channels, positions, num_groups, self.branch_count)
             grouped_monomials = self._all_monomials(grouped)
             coeff = coeff_block.unsqueeze(0).unsqueeze(2)
             tree_values = torch.sum(grouped_monomials * coeff, dim=-1)
@@ -365,6 +367,22 @@ class FullPolyConv2d(nn.Module):
 
         out = self._apply_activation(tree_values.squeeze(-1)).reshape(batch_size, self.out_channels, out_h, out_w)
         return out
+
+    def _forward_cuda_kernel(self, x: torch.Tensor) -> torch.Tensor:
+        # Uses batched tensor indexing/gather ops that dispatch to CUDA kernels.
+        return self._forward_vectorized(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise ValueError(f"Expected x to be shape [batch, channels, H, W], got {tuple(x.shape)}")
+
+        batch_size, in_channels, _, _ = x.shape
+        if in_channels != self.in_channels:
+            raise ValueError(f"Expected in_channels={self.in_channels}, got {in_channels}")
+
+        if x.is_cuda:
+            return self._forward_cuda_kernel(x)
+        return self._forward_vectorized(x)
 
     def _apply_activation(self, x: torch.Tensor) -> torch.Tensor:
         if self.activation_name == "sigmoid":
@@ -556,7 +574,7 @@ class ConvPolyNetwork(nn.Module):
         in_channels: int = 3,
         num_classes: int = 10,
         input_percent: float = 0.2,
-        branch_count: int = 2,
+        branch_count: int = 6,
         conv_depth: int = 2,
         hidden_activation: str = "sigmoid",
         output_activation: str = "softmax",
@@ -712,6 +730,8 @@ class ExampleTrainer:
     @staticmethod
     def run_demo() -> None:
         train_loader, test_loader = ExampleTrainer.make_loaders(batch_size=128, train_limit=20000, test_limit=2000)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
 
         model = FullPolyNetwork(
             input_dim=28 * 28,
@@ -722,7 +742,7 @@ class ExampleTrainer:
             output_activation="softmax",
             l1_lambda=1e-5,
             #max_selected_features=6,
-        )
+        ).to(device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
         criterion = nn.NLLLoss()
@@ -731,7 +751,8 @@ class ExampleTrainer:
             model.train()
             train_loss = 0.0
             for xb, yb in train_loader:
-                xb = xb.view(xb.size(0), -1)
+                xb = xb.view(xb.size(0), -1).to(device)
+                yb = yb.to(device)
                 optimizer.zero_grad()
                 probs = model(xb)
                 loss = criterion(torch.log(probs.clamp_min(1e-8)), yb) + model.regularization_loss()
@@ -744,7 +765,8 @@ class ExampleTrainer:
             total = 0
             with torch.no_grad():
                 for xb, yb in test_loader:
-                    xb = xb.view(xb.size(0), -1)
+                    xb = xb.view(xb.size(0), -1).to(device)
+                    yb = yb.to(device)
                     preds = model(xb).argmax(dim=1)
                     correct += (preds == yb).sum().item()
                     total += yb.size(0)
@@ -764,6 +786,8 @@ class ExampleTrainer:
             train_limit=train_limit,
             test_limit=test_limit,
         )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
 
         model = ConvPolyNetwork(
             k=k,
@@ -771,21 +795,24 @@ class ExampleTrainer:
             in_channels=3,
             num_classes=10,
             input_percent=0.2,
-            branch_count=2,
+            branch_count=4,
             conv_depth=2,
             hidden_activation="sigmoid",
             output_activation="softmax",
             l1_lambda=1e-5,
             max_selected_features=8,
-        )
+        ).to(device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
         criterion = nn.NLLLoss()
 
+        print(f"Training ConvPolyNetwork with k={k}, epochs={epochs}, batch_size={batch_size}")
         for epoch in range(epochs):
             model.train()
             train_loss = 0.0
             for xb, yb in train_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
                 optimizer.zero_grad()
                 probs = model(xb)
                 loss = criterion(torch.log(probs.clamp_min(1e-8)), yb) + model.regularization_loss()
@@ -798,6 +825,8 @@ class ExampleTrainer:
             total = 0
             with torch.no_grad():
                 for xb, yb in test_loader:
+                    xb = xb.to(device)
+                    yb = yb.to(device)
                     preds = model(xb).argmax(dim=1)
                     correct += (preds == yb).sum().item()
                     total += yb.size(0)
