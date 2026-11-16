@@ -950,7 +950,7 @@ class ExampleTrainer:
     @staticmethod
     def run_cifar10_conv_demo(
         k: int = 52,
-        epochs: int = 20,
+        epochs: int = 100,
         batch_size: int = 64,
         train_limit: Optional[int] = None,
         test_limit: Optional[int] = None,
@@ -991,7 +991,7 @@ class ExampleTrainer:
                 yb = yb.to(device)
                 optimizer.zero_grad()
                 probs = model(xb)
-                loss = criterion(torch.log(probs.clamp_min(1e-8)), yb) + model.regularization_loss()
+                loss = criterion(torch.log(probs.clamp_min(1e-8)), yb) #+ model.regularization_loss()
                 loss.backward()
                 optimizer.step()
                 model.replace_negative_inputs(init_mean=1.0, init_std=0.05)
