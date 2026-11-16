@@ -861,7 +861,7 @@ class ExampleTrainer:
 
     @staticmethod
     def run_cifar10_conv_demo(
-        k: int = 4,
+        k: int = 8,
         epochs: int = 20,
         batch_size: int = 64,
         train_limit: Optional[int] = None,
@@ -881,14 +881,16 @@ class ExampleTrainer:
             in_channels=3,
             num_classes=10,
             input_percent=0.2,
-            branch_count=4,
-            conv_depth=2,
+            branch_count=6,
+            conv_depth=1,
             hidden_activation="sigmoid",
             output_activation="softmax",
             l1_lambda=1e-5,
             max_selected_features=8,
         ).to(device)
 
+        print(f"Model has {sum(p.numel() for p in model.parameters())} parameters")
+        print(model)
         optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
         criterion = nn.NLLLoss()
 
