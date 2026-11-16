@@ -307,7 +307,7 @@ class FullPolyConv2d(nn.Module):
 
         self.register_buffer(
             "connectivity",
-            torch.empty(self.out_channels, self.num_leaves, self.num_inputs_per_leaf, 3, dtype=torch.long),
+            torch.empty(self.out_channels, self.num_leaves, self.num_inputs_per_leaf, 3, dtype=torch.int16),
         )
         self.register_buffer(
             "channel_group_assignments",
@@ -336,13 +336,13 @@ class FullPolyConv2d(nn.Module):
             if len(allowed_channel_ids) == 0:
                 allowed_channel_ids = list(range(self.in_channels))
 
-            allowed_channels_tensor = torch.tensor(allowed_channel_ids, dtype=torch.long)
+            allowed_channels_tensor = torch.tensor(allowed_channel_ids, dtype=torch.int16)
             for leaf in range(self.num_leaves):
                 random_channel_choices = allowed_channels_tensor[
                     torch.randint(0, len(allowed_channel_ids), (self.num_inputs_per_leaf,))
                 ]
-                random_x = torch.randint(0, self.kernel_w, (self.num_inputs_per_leaf,), dtype=torch.long)
-                random_y = torch.randint(0, self.kernel_h, (self.num_inputs_per_leaf,), dtype=torch.long)
+                random_x = torch.randint(0, self.kernel_w, (self.num_inputs_per_leaf,), dtype=torch.int16)
+                random_y = torch.randint(0, self.kernel_h, (self.num_inputs_per_leaf,), dtype=torch.int16)
                 for inp in range(self.num_inputs_per_leaf):
                     self.connectivity[k, leaf, inp, 0] = random_channel_choices[inp]
                     self.connectivity[k, leaf, inp, 1] = random_x[inp]
@@ -368,12 +368,12 @@ class FullPolyConv2d(nn.Module):
         positions = out_h * out_w
         flat_windows = windows.reshape(batch_size, positions, in_channels * self.kernel_h * self.kernel_w)
 
-        connectivity = self.connectivity.to(x.device)
+        connectivity = self.connectivity.to(x.device, dtype=torch.int32)
         flat_idx = (
             connectivity[..., 0] * (self.kernel_h * self.kernel_w)
             + connectivity[..., 1] * self.kernel_w
             + connectivity[..., 2]
-        ).long()
+        ).to(torch.int32)
 
         # Advanced indexing gathers all out_channels/leaves in one shot.
         sampled = flat_windows[:, :, flat_idx]
@@ -421,12 +421,12 @@ class FullPolyConv2d(nn.Module):
         positions = out_h * out_w
         flat_windows = windows.reshape(batch_size, positions, in_channels * self.kernel_h * self.kernel_w).contiguous()
 
-        connectivity = self.connectivity.to(x.device)
+        connectivity = self.connectivity.to(x.device, dtype=torch.int32)
         flat_idx = (
             connectivity[..., 0] * (self.kernel_h * self.kernel_w)
             + connectivity[..., 1] * self.kernel_w
             + connectivity[..., 2]
-        ).long().contiguous()
+        ).to(torch.int32).contiguous()
 
         sampled = ext.gather_windows(flat_windows, flat_idx)
         # [batch, out_channels, positions, num_leaves, num_inputs_per_leaf]
@@ -684,7 +684,7 @@ class ConvPolyNetwork(nn.Module):
         current_size = self.input_size
         out_channels = self.k
 
-        # First layer: receptive field 4, stride 1, depth 2.
+        # First layer: receptive field 4, stride 1, depth 1.
         conv_layers.append(
             FullPolyConv2d(
                 in_channels=current_channels,
@@ -861,7 +861,7 @@ class ExampleTrainer:
 
     @staticmethod
     def run_cifar10_conv_demo(
-        k: int = 8,
+        k: int = 52,
         epochs: int = 20,
         batch_size: int = 64,
         train_limit: Optional[int] = None,
@@ -934,3 +934,4 @@ class ExampleTrainer:
 
 if __name__ == "__main__":
     ExampleTrainer.run_cifar10_conv_demo()
+    #ExampleTrainer.run_demo()

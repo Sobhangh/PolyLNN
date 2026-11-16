@@ -6,7 +6,7 @@ namespace {
 
 __global__ void gather_windows_kernel(
     const float* __restrict__ flat_windows,
-    const int64_t* __restrict__ flat_idx,
+    const int32_t* __restrict__ flat_idx,
     float* __restrict__ out,
     int64_t B,
     int64_t P,
@@ -32,7 +32,7 @@ __global__ void gather_windows_kernel(
     int64_t b = linear;
 
     int64_t idx_offset = (oc * L + l) * I + i;
-    int64_t feature_idx = flat_idx[idx_offset];
+    int32_t feature_idx = flat_idx[idx_offset];
 
     if (feature_idx < 0 || feature_idx >= F) {
         out[(((b * OC + oc) * P + p) * L + l) * I + i] = 0.0f;
@@ -66,7 +66,7 @@ at::Tensor polyconv_gather_windows_cuda(
 
     gather_windows_kernel<<<blocks, threads>>>(
         flat_windows.data_ptr<float>(),
-        flat_idx.data_ptr<int64_t>(),
+        flat_idx.data_ptr<int32_t>(),
         out.data_ptr<float>(),
         B,
         P,

@@ -12,7 +12,7 @@ at::Tensor gather_windows(
     TORCH_CHECK(flat_windows.is_cuda(), "flat_windows must be a CUDA tensor");
     TORCH_CHECK(flat_idx.is_cuda(), "flat_idx must be a CUDA tensor");
     TORCH_CHECK(flat_windows.scalar_type() == at::kFloat, "flat_windows must be float32");
-    TORCH_CHECK(flat_idx.scalar_type() == at::kLong, "flat_idx must be int64");
+    TORCH_CHECK(flat_idx.scalar_type() == at::kInt, "flat_idx must be int32");
     TORCH_CHECK(flat_windows.dim() == 3, "flat_windows must have shape [B, P, F]");
     TORCH_CHECK(flat_idx.dim() == 3, "flat_idx must have shape [OC, L, I]");
 
