@@ -101,7 +101,7 @@ class SparsePolyNeuron(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.normal_(self.input_weights, mean=0.0, std=0.5)
+        nn.init.normal_(self.input_weights, mean=1.0, std=0.05)
         nn.init.normal_(self.monomial_coeffs, mean=0.0, std=0.8)
         self.bias.data.zero_()
         self.selected_indices.copy_(torch.randperm(self.in_features)[: self.num_selected])
@@ -147,6 +147,27 @@ class SparsePolyNeuron(nn.Module):
     def top_dominant_inputs(self, k: int = 3) -> torch.Tensor:
         return torch.topk(self.input_weights.abs(), k=min(k, self.in_features)).indices
 
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+        with torch.no_grad():
+            device = self.input_weights.device
+            selected = self.selected_indices
+            selected_weights = self.input_weights[selected]
+            negative_positions = torch.nonzero(selected_weights < 0, as_tuple=False).flatten()
+
+            for pos in negative_positions.tolist():
+                old_idx = int(selected[pos].item())
+
+                available_mask = torch.ones(self.in_features, dtype=torch.bool, device=device)
+                available_mask[selected] = False
+                available = torch.nonzero(available_mask, as_tuple=False).flatten()
+                if available.numel() == 0:
+                    continue
+
+                new_idx = int(available[torch.randint(0, available.numel(), (1,), device=device)].item())
+                self.input_weights[old_idx] = 0.0
+                self.input_weights[new_idx] = init_mean + init_std * torch.randn((), device=device, dtype=self.input_weights.dtype)
+                selected[pos] = new_idx
+
 
 class FullPolyLayer(nn.Module):
     """A polynomial layer whose operations are performed in one batched matrix form."""
@@ -176,7 +197,7 @@ class FullPolyLayer(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.normal_(self.input_weights, mean=0.0, std=0.5)
+        nn.init.normal_(self.input_weights, mean=1.0, std=0.05)
         nn.init.normal_(self.monomial_coeffs, mean=0.0, std=0.8)
         self.bias.data.zero_()
         for i in range(self.out_features):
@@ -231,6 +252,30 @@ class FullPolyLayer(nn.Module):
 
     def top_dominant_inputs(self, top_k: int = 3) -> torch.Tensor:
         return torch.topk(self.input_weights.abs(), k=min(top_k, self.in_features), dim=1)
+
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+        with torch.no_grad():
+            device = self.input_weights.device
+            for neuron_idx in range(self.out_features):
+                selected = self.selected_indices[neuron_idx]
+                selected_weights = self.input_weights[neuron_idx, selected]
+                negative_positions = torch.nonzero(selected_weights < 0, as_tuple=False).flatten()
+
+                for pos in negative_positions.tolist():
+                    old_idx = int(selected[pos].item())
+
+                    available_mask = torch.ones(self.in_features, dtype=torch.bool, device=device)
+                    available_mask[selected] = False
+                    available = torch.nonzero(available_mask, as_tuple=False).flatten()
+                    if available.numel() == 0:
+                        continue
+
+                    new_idx = int(available[torch.randint(0, available.numel(), (1,), device=device)].item())
+                    self.input_weights[neuron_idx, old_idx] = 0.0
+                    self.input_weights[neuron_idx, new_idx] = (
+                        init_mean + init_std * torch.randn((), device=device, dtype=self.input_weights.dtype)
+                    )
+                    selected[pos] = new_idx
 
 
 class FullPolyConv2d(nn.Module):
@@ -317,9 +362,9 @@ class FullPolyConv2d(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.normal_(self.input_weights, mean=0.0, std=0.5)
+        nn.init.normal_(self.input_weights, mean=1.0, std=0.05)
         nn.init.normal_(self.monomial_coeffs, mean=0.0, std=0.8)
-        nn.init.normal_(self.tree_weights, mean=0.0, std=0.1)
+        nn.init.normal_(self.tree_weights, mean=0.0, std=0.8)
 
         num_groups = max(1, int(math.ceil(self.in_channels / self.group_size)))
         if self.group_mode == "random":
@@ -483,6 +528,30 @@ class FullPolyConv2d(nn.Module):
     def l1_regularization(self, lambda_value: float) -> torch.Tensor:
         return lambda_value * (torch.abs(self.input_weights).sum() + torch.abs(self.tree_weights).sum())
 
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+        with torch.no_grad():
+            device = self.input_weights.device
+            negative_positions = torch.nonzero(self.input_weights < 0, as_tuple=False)
+
+            for oc, leaf, inp in negative_positions.tolist():
+                group_id = int(self.channel_group_assignments[oc].item())
+                group_start = group_id * self.group_size
+                group_end = min(self.in_channels, group_start + self.group_size)
+                allowed_channel_ids = list(range(group_start, group_end))
+                if len(allowed_channel_ids) == 0:
+                    allowed_channel_ids = list(range(self.in_channels))
+
+                channel = int(allowed_channel_ids[torch.randint(0, len(allowed_channel_ids), (1,), device=device).item()])
+                x_coord = int(torch.randint(0, self.kernel_w, (1,), device=device).item())
+                y_coord = int(torch.randint(0, self.kernel_h, (1,), device=device).item())
+
+                self.connectivity[oc, leaf, inp, 0] = channel
+                self.connectivity[oc, leaf, inp, 1] = x_coord
+                self.connectivity[oc, leaf, inp, 2] = y_coord
+                self.input_weights[oc, leaf, inp] = (
+                    init_mean + init_std * torch.randn((), device=device, dtype=self.input_weights.dtype)
+                )
+
 
 class SparsePolyLayer(nn.Module):
     """Stack of sparse polynomial neurons."""
@@ -516,6 +585,10 @@ class SparsePolyLayer(nn.Module):
 
     def regularization_loss(self, lambda_value: float) -> torch.Tensor:
         return sum(neuron.l1_regularization(lambda_value) for neuron in self.neurons)
+
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+        for neuron in self.neurons:
+            neuron.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
 
 
 class SparsePolynomialNetwork(nn.Module):
@@ -587,6 +660,10 @@ class SparsePolynomialNetwork(nn.Module):
                     mask[keep] = True
                     neuron.input_weights.data[~mask] = 0.0
 
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+        for layer in self.layers:
+            layer.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
+
 
 class FullPolyNetwork(nn.Module):
     """A network built from FullPolyLayer blocks."""
@@ -647,6 +724,10 @@ class FullPolyNetwork(nn.Module):
         for layer in self.layers:
             total = total + layer.l1_regularization(self.l1_lambda)
         return total
+
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+        for layer in self.layers:
+            layer.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
 
 
 class ConvPolyNetwork(nn.Module):
@@ -771,6 +852,12 @@ class ConvPolyNetwork(nn.Module):
         total = total + self.poly_fc2.l1_regularization(self.l1_lambda)
         return total
 
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+        for conv in self.conv_layers:
+            conv.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
+        self.poly_fc1.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
+        self.poly_fc2.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
+
 
 class ExampleTrainer:
     """Train the sparse polynomial network on MNIST."""
@@ -844,6 +931,7 @@ class ExampleTrainer:
                 loss = criterion(torch.log(probs.clamp_min(1e-8)), yb) + model.regularization_loss()
                 loss.backward()
                 optimizer.step()
+                model.replace_negative_inputs(init_mean=1.0, init_std=0.05)
                 train_loss += loss.item() * xb.size(0)
 
             model.eval()
@@ -891,7 +979,7 @@ class ExampleTrainer:
 
         print(f"Model has {sum(p.numel() for p in model.parameters())} parameters")
         print(model)
-        optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         criterion = nn.NLLLoss()
 
         print(f"Training ConvPolyNetwork with k={k}, epochs={epochs}, batch_size={batch_size}")
@@ -906,6 +994,7 @@ class ExampleTrainer:
                 loss = criterion(torch.log(probs.clamp_min(1e-8)), yb) + model.regularization_loss()
                 loss.backward()
                 optimizer.step()
+                model.replace_negative_inputs(init_mean=1.0, init_std=0.05)
                 train_loss += loss.item() * xb.size(0)
 
             model.eval()
