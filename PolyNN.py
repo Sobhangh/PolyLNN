@@ -92,6 +92,25 @@ def _init_poly_coeffs_linear_bias(
         )
 
 
+def _normalize_coefficient_init(value: str) -> str:
+    value = str(value).strip().lower()
+    if value not in {"linear", "random"}:
+        raise ValueError("coefficient_init must be 'linear' or 'random'")
+    return value
+
+
+def _init_poly_coeffs(
+    coeffs: torch.Tensor,
+    num_inputs: int,
+    coefficient_init: str,
+) -> None:
+    coefficient_init = _normalize_coefficient_init(coefficient_init)
+    if coefficient_init == "linear":
+        _init_poly_coeffs_linear_bias(coeffs, num_inputs)
+    else:
+        nn.init.normal_(coeffs, mean=0.0, std=0.8)
+
+
 class SparsePolyNeuron(nn.Module):
     """
     A neuron with sparse random connectivity and learnable monomial coefficients.
@@ -114,6 +133,7 @@ class SparsePolyNeuron(nn.Module):
         input_percent: float,
         activation: Optional[str] = "sigmoid",
         max_selected_features: int = 8,
+        coefficient_init: str = "linear",
     ):
         super().__init__()
         self.in_features = int(in_features)
@@ -128,11 +148,11 @@ class SparsePolyNeuron(nn.Module):
         self.bias = nn.Parameter(torch.zeros(()))
         self.register_buffer("selected_indices", torch.empty(self.num_selected, dtype=torch.long))
 
-        self.reset_parameters()
+        self.reset_parameters(coefficient_init=coefficient_init)
 
-    def reset_parameters(self):
+    def reset_parameters(self, coefficient_init: str = "linear"):
         nn.init.normal_(self.input_weights, mean=1.0, std=0.05)
-        _init_poly_coeffs_linear_bias(self.monomial_coeffs, self.num_selected)
+        _init_poly_coeffs(self.monomial_coeffs, self.num_selected, coefficient_init=coefficient_init)
         self.bias.data.zero_()
         self.selected_indices.copy_(torch.randperm(self.in_features)[: self.num_selected])
 
@@ -209,6 +229,7 @@ class FullPolyLayer(nn.Module):
         input_percent: float,
         activation: str = "sigmoid",
         max_selected_features: int = 8,
+        coefficient_init: str = "linear",
     ):
         super().__init__()
         self.in_features = int(in_features)
@@ -224,11 +245,11 @@ class FullPolyLayer(nn.Module):
         self.bias = nn.Parameter(torch.zeros(self.out_features))
         self.register_buffer("selected_indices", torch.empty(self.out_features, self.num_selected, dtype=torch.long))
 
-        self.reset_parameters()
+        self.reset_parameters(coefficient_init=coefficient_init)
 
-    def reset_parameters(self):
+    def reset_parameters(self, coefficient_init: str = "linear"):
         nn.init.normal_(self.input_weights, mean=1.0, std=0.05)
-        _init_poly_coeffs_linear_bias(self.monomial_coeffs, self.num_selected)
+        _init_poly_coeffs(self.monomial_coeffs, self.num_selected, coefficient_init=coefficient_init)
         self.bias.data.zero_()
         for i in range(self.out_features):
             self.selected_indices[i].copy_(torch.randperm(self.in_features)[: self.num_selected])
@@ -340,6 +361,7 @@ class FullPolyConv2d(nn.Module):
         group_mode: str = "ordered",
         activation: str = "sigmoid",
         max_selected_features: int = 8,
+        coefficient_init: str = "random",
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -389,16 +411,25 @@ class FullPolyConv2d(nn.Module):
             torch.empty(self.out_channels, dtype=torch.long),
         )
 
-        self.reset_parameters()
+        self.reset_parameters(coefficient_init=coefficient_init)
         # print(f"Connectivity {self.connectivity}")
         # print(f"Input weights {self.input_weights}")
         # print(f"Monomial coeffs {self.monomial_coeffs}")
         # print(f"Tree weights {self.tree_weights}")
 
-    def reset_parameters(self):
+    def reset_parameters(self, coefficient_init: str = "random"):
+        self.coefficient_init = _normalize_coefficient_init(coefficient_init)
         nn.init.normal_(self.input_weights, mean=1.0, std=0.05)
-        _init_poly_coeffs_linear_bias(self.monomial_coeffs, self.num_inputs_per_leaf)
-        _init_poly_coeffs_linear_bias(self.tree_weights, self.branch_count)
+        _init_poly_coeffs(
+            self.monomial_coeffs,
+            self.num_inputs_per_leaf,
+            coefficient_init=self.coefficient_init,
+        )
+        _init_poly_coeffs(
+            self.tree_weights,
+            self.branch_count,
+            coefficient_init=self.coefficient_init,
+        )
 
         num_groups = max(1, int(math.ceil(self.in_channels / self.group_size)))
         if self.group_mode == "random":
@@ -597,6 +628,7 @@ class SparsePolyLayer(nn.Module):
         input_percent: float,
         activation: str = "sigmoid",
         max_selected_features: int = 8,
+        coefficient_init: str = "linear",
     ):
         super().__init__()
         self.in_features = int(in_features)
@@ -609,6 +641,7 @@ class SparsePolyLayer(nn.Module):
                     self.input_percent,
                     activation=activation,
                     max_selected_features=max_selected_features,
+                    coefficient_init=coefficient_init,
                 )
                 for _ in range(self.out_features)
             ]
@@ -638,6 +671,7 @@ class SparsePolynomialNetwork(nn.Module):
         output_activation: Optional[str] = "sigmoid",
         l1_lambda: float = 1e-4,
         max_selected_features: int = 10,
+        coefficient_init: str = "linear",
     ):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -659,6 +693,7 @@ class SparsePolynomialNetwork(nn.Module):
                     self.input_percent,
                     activation=self.hidden_activation,
                     max_selected_features=self.max_selected_features,
+                    coefficient_init=coefficient_init,
                 )
             )
             prev = hidden_size
@@ -712,6 +747,7 @@ class FullPolyNetwork(nn.Module):
         output_activation: Optional[str] = "sigmoid",
         l1_lambda: float = 1e-4,
         max_selected_features: int = 8,
+        coefficient_init: str = "linear",
     ):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -733,6 +769,7 @@ class FullPolyNetwork(nn.Module):
                     self.input_percent,
                     activation=self.hidden_activation,
                     max_selected_features=self.max_selected_features,
+                    coefficient_init=coefficient_init,
                 )
             )
             prev = hidden_size
@@ -780,6 +817,7 @@ class ConvPolyNetwork(nn.Module):
         output_activation: str = "softmax",
         l1_lambda: float = 1e-5,
         max_selected_features: int = 8,
+        coefficient_init: str = "random",
     ):
         super().__init__()
         self.k = int(k)
@@ -812,6 +850,7 @@ class ConvPolyNetwork(nn.Module):
                 depth=self.conv_depth,
                 activation=self.hidden_activation,
                 max_selected_features=self.max_selected_features,
+                coefficient_init=coefficient_init,
             )
         )
         current_size = (current_size - 4) // 1 + 1
@@ -833,6 +872,7 @@ class ConvPolyNetwork(nn.Module):
                     activation=self.hidden_activation,
                     group_size=4,
                     max_selected_features=self.max_selected_features,
+                    coefficient_init=coefficient_init,
                 )
             )
             current_size = (current_size - 3) // 2 + 1
@@ -850,6 +890,7 @@ class ConvPolyNetwork(nn.Module):
             input_percent=self.input_percent,
             activation=self.hidden_activation,
             max_selected_features=self.max_selected_features,
+            coefficient_init=coefficient_init,
         )
         self.poly_fc2 = FullPolyLayer(
             in_features=self.hidden_width,
@@ -857,6 +898,7 @@ class ConvPolyNetwork(nn.Module):
             input_percent=self.input_percent,
             activation=self.hidden_activation,
             max_selected_features=self.max_selected_features,
+            coefficient_init=coefficient_init,
         )
         self.output_head = nn.Linear(self.hidden_width, self.num_classes)
 
