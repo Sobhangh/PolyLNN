@@ -62,6 +62,18 @@ def _normalize_percent(value: float) -> float:
     return float(value) / 100.0
 
 
+def _normalize_float_bits(value: int) -> int:
+    bits = int(value)
+    if bits not in (16, 32):
+        raise ValueError("float_bits must be 16 or 32")
+    return bits
+
+
+def _dtype_from_bits(value: int) -> torch.dtype:
+    bits = _normalize_float_bits(value)
+    return torch.float16 if bits == 16 else torch.float32
+
+
 def _degree_leq_one_indices(num_inputs: int, device: torch.device) -> torch.Tensor:
     linear_indices = [0]
     linear_indices.extend(1 << i for i in range(max(0, int(num_inputs))))
@@ -134,6 +146,7 @@ class SparsePolyNeuron(nn.Module):
         activation: Optional[str] = "sigmoid",
         max_selected_features: int = 8,
         coefficient_init: str = "linear",
+        float_bits: int = 32,
     ):
         super().__init__()
         self.in_features = int(in_features)
@@ -142,10 +155,12 @@ class SparsePolyNeuron(nn.Module):
         self.num_selected = max(1, int(round(self.input_percent * self.in_features)))
         self.num_selected = min(self.num_selected, self.in_features, self.max_selected_features)
         self.activation_name = activation or "sigmoid"
+        self.float_bits = _normalize_float_bits(float_bits)
+        self.compute_dtype = _dtype_from_bits(self.float_bits)
 
-        self.input_weights = nn.Parameter(torch.empty(self.in_features))
-        self.monomial_coeffs = nn.Parameter(torch.empty(2 ** self.num_selected))
-        self.bias = nn.Parameter(torch.zeros(()))
+        self.input_weights = nn.Parameter(torch.empty(self.in_features, dtype=self.compute_dtype))
+        self.monomial_coeffs = nn.Parameter(torch.empty(2 ** self.num_selected, dtype=self.compute_dtype))
+        self.bias = nn.Parameter(torch.zeros((), dtype=self.compute_dtype))
         self.register_buffer("selected_indices", torch.empty(self.num_selected, dtype=torch.long))
 
         self.reset_parameters(coefficient_init=coefficient_init)
@@ -172,6 +187,7 @@ class SparsePolyNeuron(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 2:
             raise ValueError(f"Expected x to be shape [batch, in_features], got {tuple(x.shape)}")
+        x = x.to(dtype=self.input_weights.dtype)
 
         selected_idx = self.selected_indices.to(x.device)
         selected_x = x[:, selected_idx]
@@ -230,6 +246,7 @@ class FullPolyLayer(nn.Module):
         activation: str = "sigmoid",
         max_selected_features: int = 8,
         coefficient_init: str = "linear",
+        float_bits: int = 32,
     ):
         super().__init__()
         self.in_features = int(in_features)
@@ -239,10 +256,12 @@ class FullPolyLayer(nn.Module):
         self.num_selected = max(1, int(round(self.input_percent * self.in_features)))
         self.num_selected = min(self.num_selected, self.in_features, self.max_selected_features)
         self.activation_name = activation or "sigmoid"
+        self.float_bits = _normalize_float_bits(float_bits)
+        self.compute_dtype = _dtype_from_bits(self.float_bits)
 
-        self.input_weights = nn.Parameter(torch.empty(self.out_features, self.in_features))
-        self.monomial_coeffs = nn.Parameter(torch.empty(self.out_features, 2 ** self.num_selected))
-        self.bias = nn.Parameter(torch.zeros(self.out_features))
+        self.input_weights = nn.Parameter(torch.empty(self.out_features, self.in_features, dtype=self.compute_dtype))
+        self.monomial_coeffs = nn.Parameter(torch.empty(self.out_features, 2 ** self.num_selected, dtype=self.compute_dtype))
+        self.bias = nn.Parameter(torch.zeros(self.out_features, dtype=self.compute_dtype))
         self.register_buffer("selected_indices", torch.empty(self.out_features, self.num_selected, dtype=torch.long))
 
         self.reset_parameters(coefficient_init=coefficient_init)
@@ -282,6 +301,7 @@ class FullPolyLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 2:
             raise ValueError(f"Expected x to be shape [batch, in_features], got {tuple(x.shape)}")
+        x = x.to(dtype=self.input_weights.dtype)
 
         if x.is_cuda:
             z = self._forward_cuda_kernel(x)
@@ -362,6 +382,7 @@ class FullPolyConv2d(nn.Module):
         activation: str = "sigmoid",
         max_selected_features: int = 8,
         coefficient_init: str = "random",
+        float_bits: int = 32,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -376,6 +397,8 @@ class FullPolyConv2d(nn.Module):
         self.group_mode = group_mode
         self.activation_name = activation or "sigmoid"
         self.max_selected_features = max(1, int(max_selected_features))
+        self.float_bits = _normalize_float_bits(float_bits)
+        self.compute_dtype = _dtype_from_bits(self.float_bits)
 
         if self.branch_count <= 1:
             raise ValueError("branch_count must be >= 2")
@@ -398,9 +421,15 @@ class FullPolyConv2d(nn.Module):
             self.num_internal_nodes += remaining // self.branch_count
             remaining = remaining // self.branch_count
 
-        self.input_weights = nn.Parameter(torch.empty(self.out_channels, self.num_leaves, self.num_inputs_per_leaf))
-        self.monomial_coeffs = nn.Parameter(torch.empty(self.out_channels, self.num_leaves, 2 ** self.num_inputs_per_leaf))
-        self.tree_weights = nn.Parameter(torch.empty(self.out_channels, self.num_internal_nodes, 2 ** self.branch_count))
+        self.input_weights = nn.Parameter(
+            torch.empty(self.out_channels, self.num_leaves, self.num_inputs_per_leaf, dtype=self.compute_dtype)
+        )
+        self.monomial_coeffs = nn.Parameter(
+            torch.empty(self.out_channels, self.num_leaves, 2 ** self.num_inputs_per_leaf, dtype=self.compute_dtype)
+        )
+        self.tree_weights = nn.Parameter(
+            torch.empty(self.out_channels, self.num_internal_nodes, 2 ** self.branch_count, dtype=self.compute_dtype)
+        )
 
         self.register_buffer(
             "connectivity",
@@ -467,6 +496,7 @@ class FullPolyConv2d(nn.Module):
         return terms
 
     def _forward_vectorized(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(dtype=self.input_weights.dtype)
         batch_size, in_channels, height, width = x.shape
 
         padded = nn.functional.pad(x, (self.padding, self.padding, self.padding, self.padding))
@@ -520,6 +550,8 @@ class FullPolyConv2d(nn.Module):
         ext = _get_polyconv_cuda_ext()
         if ext is None:
             return self._forward_vectorized(x)
+
+        x = x.to(dtype=self.input_weights.dtype)
 
         batch_size, in_channels, height, width = x.shape
         padded = nn.functional.pad(x, (self.padding, self.padding, self.padding, self.padding))
@@ -629,6 +661,7 @@ class SparsePolyLayer(nn.Module):
         activation: str = "sigmoid",
         max_selected_features: int = 8,
         coefficient_init: str = "linear",
+        float_bits: int = 32,
     ):
         super().__init__()
         self.in_features = int(in_features)
@@ -642,6 +675,7 @@ class SparsePolyLayer(nn.Module):
                     activation=activation,
                     max_selected_features=max_selected_features,
                     coefficient_init=coefficient_init,
+                    float_bits=float_bits,
                 )
                 for _ in range(self.out_features)
             ]
@@ -672,6 +706,8 @@ class SparsePolynomialNetwork(nn.Module):
         l1_lambda: float = 1e-4,
         max_selected_features: int = 10,
         coefficient_init: str = "linear",
+        float_bits: int = 32,
+        replacement_threshold: float = 0.2,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -682,6 +718,9 @@ class SparsePolynomialNetwork(nn.Module):
         self.hidden_activation = hidden_activation
         self.output_activation = output_activation
         self.max_selected_features = max(1, int(max_selected_features))
+        self.float_bits = _normalize_float_bits(float_bits)
+        self.compute_dtype = _dtype_from_bits(self.float_bits)
+        self.replacement_threshold = float(replacement_threshold)
 
         self.layers = nn.ModuleList()
         prev = self.input_dim
@@ -694,13 +733,15 @@ class SparsePolynomialNetwork(nn.Module):
                     activation=self.hidden_activation,
                     max_selected_features=self.max_selected_features,
                     coefficient_init=coefficient_init,
+                    float_bits=self.float_bits,
                 )
             )
             prev = hidden_size
 
-        self.output_head = nn.Linear(prev, self.output_dim)
+        self.output_head = nn.Linear(prev, self.output_dim, dtype=self.compute_dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(dtype=self.compute_dtype)
         for layer in self.layers:
             x = layer(x)
         logits = self.output_head(x)
@@ -720,9 +761,10 @@ class SparsePolynomialNetwork(nn.Module):
             total = total + layer.regularization_loss(self.l1_lambda)
         return total
 
-    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: float = 0.2) -> None:
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: Optional[float] = None) -> None:
+        threshold = self.replacement_threshold if replacement_threshold is None else float(replacement_threshold)
         for layer in self.layers:
-            layer.replace_negative_inputs(init_mean=init_mean, init_std=init_std, replacement_threshold=replacement_threshold)
+            layer.replace_negative_inputs(init_mean=init_mean, init_std=init_std, replacement_threshold=threshold)
 
 
 
@@ -740,6 +782,8 @@ class FullPolyNetwork(nn.Module):
         l1_lambda: float = 1e-4,
         max_selected_features: int = 8,
         coefficient_init: str = "linear",
+        float_bits: int = 32,
+        replacement_threshold: float = 0.2,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -750,6 +794,9 @@ class FullPolyNetwork(nn.Module):
         self.hidden_activation = hidden_activation
         self.output_activation = output_activation
         self.max_selected_features = max(1, int(max_selected_features))
+        self.float_bits = _normalize_float_bits(float_bits)
+        self.compute_dtype = _dtype_from_bits(self.float_bits)
+        self.replacement_threshold = float(replacement_threshold)
 
         self.layers = nn.ModuleList()
         prev = self.input_dim
@@ -762,13 +809,15 @@ class FullPolyNetwork(nn.Module):
                     activation=self.hidden_activation,
                     max_selected_features=self.max_selected_features,
                     coefficient_init=coefficient_init,
+                    float_bits=self.float_bits,
                 )
             )
             prev = hidden_size
 
-        self.output_head = nn.Linear(prev, self.output_dim)
+        self.output_head = nn.Linear(prev, self.output_dim, dtype=self.compute_dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(dtype=self.compute_dtype)
         for layer in self.layers:
             x = layer(x)
         logits = self.output_head(x)
@@ -788,9 +837,10 @@ class FullPolyNetwork(nn.Module):
             total = total + layer.l1_regularization(self.l1_lambda)
         return total
 
-    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: float = 0.2) -> None:
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: Optional[float] = None) -> None:
+        threshold = self.replacement_threshold if replacement_threshold is None else float(replacement_threshold)
         for layer in self.layers:
-            layer.replace_negative_inputs(init_mean=init_mean, init_std=init_std, replacement_threshold=replacement_threshold)
+            layer.replace_negative_inputs(init_mean=init_mean, init_std=init_std, replacement_threshold=threshold)
 
 
 class ConvPolyNetwork(nn.Module):
@@ -810,6 +860,8 @@ class ConvPolyNetwork(nn.Module):
         l1_lambda: float = 1e-5,
         max_selected_features: int = 8,
         coefficient_init: str = "random",
+        float_bits: int = 32,
+        replacement_threshold: float = 0.2,
     ):
         super().__init__()
         self.k = int(k)
@@ -823,6 +875,9 @@ class ConvPolyNetwork(nn.Module):
         self.output_activation = output_activation
         self.l1_lambda = float(l1_lambda)
         self.max_selected_features = max(1, int(max_selected_features))
+        self.float_bits = _normalize_float_bits(float_bits)
+        self.compute_dtype = _dtype_from_bits(self.float_bits)
+        self.replacement_threshold = float(replacement_threshold)
 
         conv_layers: List[nn.Module] = []
         current_channels = self.in_channels
@@ -843,6 +898,7 @@ class ConvPolyNetwork(nn.Module):
                 activation=self.hidden_activation,
                 max_selected_features=self.max_selected_features,
                 coefficient_init=coefficient_init,
+                float_bits=self.float_bits,
             )
         )
         current_size = (current_size - 4) // 1 + 1
@@ -865,6 +921,7 @@ class ConvPolyNetwork(nn.Module):
                     group_size=4,
                     max_selected_features=self.max_selected_features,
                     coefficient_init=coefficient_init,
+                    float_bits=self.float_bits,
                 )
             )
             current_size = (current_size - 3) // 2 + 1
@@ -883,6 +940,7 @@ class ConvPolyNetwork(nn.Module):
             activation=self.hidden_activation,
             max_selected_features=self.max_selected_features,
             coefficient_init=coefficient_init,
+            float_bits=self.float_bits,
         )
         self.poly_fc2 = FullPolyLayer(
             in_features=self.hidden_width,
@@ -891,10 +949,12 @@ class ConvPolyNetwork(nn.Module):
             activation=self.hidden_activation,
             max_selected_features=self.max_selected_features,
             coefficient_init=coefficient_init,
+            float_bits=self.float_bits,
         )
-        self.output_head = nn.Linear(self.hidden_width, self.num_classes)
+        self.output_head = nn.Linear(self.hidden_width, self.num_classes, dtype=self.compute_dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(dtype=self.compute_dtype)
         for conv in self.conv_layers:
             x = conv(x)
         x = x.reshape(x.size(0), -1)
@@ -920,11 +980,12 @@ class ConvPolyNetwork(nn.Module):
         total = total + self.poly_fc2.l1_regularization(self.l1_lambda)
         return total
 
-    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: Optional[float] = None) -> None:
+        threshold = self.replacement_threshold if replacement_threshold is None else float(replacement_threshold)
         for conv in self.conv_layers:
-            conv.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
-        self.poly_fc1.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
-        self.poly_fc2.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
+            conv.replace_negative_inputs(init_mean=init_mean, init_std=init_std, replacement_threshold=threshold)
+        self.poly_fc1.replace_negative_inputs(init_mean=init_mean, init_std=init_std, replacement_threshold=threshold)
+        self.poly_fc2.replace_negative_inputs(init_mean=init_mean, init_std=init_std, replacement_threshold=threshold)
 
 
 class ExampleTrainer:
@@ -988,10 +1049,16 @@ class ExampleTrainer:
         print(f"Output y: {testM(x)}")
 
     @staticmethod
-    def run_demo() -> None:
+    def run_demo(
+        float_bits: int = 32,
+        replacement_threshold: float = 0.2,
+    ) -> None:
         train_loader, test_loader = ExampleTrainer.make_loaders(batch_size=128, train_limit=20000, test_limit=2000)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
+        if float_bits == 16 and device.type != "cuda":
+            warnings.warn("float_bits=16 requested on CPU; falling back to float_bits=32")
+            float_bits = 32
 
         model = FullPolyNetwork(
             input_dim=28 * 28,
@@ -1001,6 +1068,8 @@ class ExampleTrainer:
             hidden_activation="sigmoid",
             output_activation="softmax",
             l1_lambda=1e-5,
+            float_bits=float_bits,
+            replacement_threshold=replacement_threshold,
             #max_selected_features=6,
         ).to(device)
 
@@ -1041,6 +1110,8 @@ class ExampleTrainer:
         batch_size: int = 64,
         train_limit: Optional[int] = None,
         test_limit: Optional[int] = None,
+        float_bits: int = 16,
+        replacement_threshold: float = 0.2,
     ) -> None:
         train_loader, test_loader = ExampleTrainer.make_cifar10_loaders(
             batch_size=batch_size,
@@ -1049,6 +1120,9 @@ class ExampleTrainer:
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
+        if float_bits == 16 and device.type != "cuda":
+            warnings.warn("float_bits=16 requested on CPU; falling back to float_bits=32")
+            float_bits = 32
 
         model = ConvPolyNetwork(
             k=k,
@@ -1062,6 +1136,8 @@ class ExampleTrainer:
             output_activation="softmax",
             l1_lambda=1e-5,
             max_selected_features=8,
+            float_bits=float_bits,
+            replacement_threshold=replacement_threshold,
         ).to(device)
 
         print(f"Model has {sum(p.numel() for p in model.parameters())} parameters")

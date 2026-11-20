@@ -4,10 +4,11 @@
 
 namespace {
 
+template <typename scalar_t>
 __global__ void gather_windows_kernel(
-    const float* __restrict__ flat_windows,
+    const scalar_t* __restrict__ flat_windows,
     const int32_t* __restrict__ flat_idx,
-    float* __restrict__ out,
+    scalar_t* __restrict__ out,
     int64_t B,
     int64_t P,
     int64_t F,
@@ -35,7 +36,7 @@ __global__ void gather_windows_kernel(
     int32_t feature_idx = flat_idx[idx_offset];
 
     if (feature_idx < 0 || feature_idx >= F) {
-        out[(((b * OC + oc) * P + p) * L + l) * I + i] = 0.0f;
+        out[(((b * OC + oc) * P + p) * L + l) * I + i] = static_cast<scalar_t>(0);
         return;
     }
 
@@ -64,17 +65,19 @@ at::Tensor polyconv_gather_windows_cuda(
     constexpr int threads = 256;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
 
-    gather_windows_kernel<<<blocks, threads>>>(
-        flat_windows.data_ptr<float>(),
-        flat_idx.data_ptr<int32_t>(),
-        out.data_ptr<float>(),
-        B,
-        P,
-        F,
-        OC,
-        L,
-        I
-    );
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(flat_windows.scalar_type(), "polyconv_gather_windows_cuda", ([&] {
+        gather_windows_kernel<scalar_t><<<blocks, threads>>>(
+            flat_windows.data_ptr<scalar_t>(),
+            flat_idx.data_ptr<int32_t>(),
+            out.data_ptr<scalar_t>(),
+            B,
+            P,
+            F,
+            OC,
+            L,
+            I
+        );
+    }));
 
     return out;
 }
