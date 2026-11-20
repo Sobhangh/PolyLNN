@@ -1032,7 +1032,7 @@ class ExampleTrainer:
 
         print(f"Model has {sum(p.numel() for p in model.parameters())} parameters")
         print(model)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        optimizer = torch.optim.Adam(model.parameters(), lr=5e-3)
         criterion = nn.NLLLoss()
 
         print(f"Training ConvPolyNetwork with k={k}, epochs={epochs}, batch_size={batch_size}")
