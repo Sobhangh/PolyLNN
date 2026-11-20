@@ -62,6 +62,36 @@ def _normalize_percent(value: float) -> float:
     return float(value) / 100.0
 
 
+def _degree_leq_one_indices(num_inputs: int, device: torch.device) -> torch.Tensor:
+    linear_indices = [0]
+    linear_indices.extend(1 << i for i in range(max(0, int(num_inputs))))
+    return torch.tensor(linear_indices, device=device, dtype=torch.long)
+
+
+def _init_poly_coeffs_linear_bias(
+    coeffs: torch.Tensor,
+    num_inputs: int,
+    linear_abs_mean: float = 1.0,
+    linear_abs_std: float = 0.05,
+    higher_mean: float = 0.0,
+    higher_std: float = 0.05,
+) -> None:
+    with torch.no_grad():
+        nn.init.normal_(coeffs, mean=higher_mean, std=higher_std)
+        linear_idx = _degree_leq_one_indices(num_inputs, coeffs.device)
+        magnitudes = torch.abs(
+            linear_abs_mean
+            + linear_abs_std
+            * torch.randn(*coeffs.shape[:-1], linear_idx.numel(), device=coeffs.device, dtype=coeffs.dtype)
+        )
+        signs = (2 * torch.randint(0, 2, magnitudes.shape, device=coeffs.device, dtype=torch.int64) - 1).to(coeffs.dtype)
+        coeffs.index_copy_(
+            -1,
+            linear_idx,
+            signs * magnitudes,
+        )
+
+
 class SparsePolyNeuron(nn.Module):
     """
     A neuron with sparse random connectivity and learnable monomial coefficients.
@@ -102,7 +132,7 @@ class SparsePolyNeuron(nn.Module):
 
     def reset_parameters(self):
         nn.init.normal_(self.input_weights, mean=1.0, std=0.05)
-        nn.init.normal_(self.monomial_coeffs, mean=0.0, std=0.8)
+        _init_poly_coeffs_linear_bias(self.monomial_coeffs, self.num_selected)
         self.bias.data.zero_()
         self.selected_indices.copy_(torch.randperm(self.in_features)[: self.num_selected])
 
@@ -198,7 +228,7 @@ class FullPolyLayer(nn.Module):
 
     def reset_parameters(self):
         nn.init.normal_(self.input_weights, mean=1.0, std=0.05)
-        nn.init.normal_(self.monomial_coeffs, mean=0.0, std=0.8)
+        _init_poly_coeffs_linear_bias(self.monomial_coeffs, self.num_selected)
         self.bias.data.zero_()
         for i in range(self.out_features):
             self.selected_indices[i].copy_(torch.randperm(self.in_features)[: self.num_selected])
@@ -360,11 +390,15 @@ class FullPolyConv2d(nn.Module):
         )
 
         self.reset_parameters()
+        # print(f"Connectivity {self.connectivity}")
+        # print(f"Input weights {self.input_weights}")
+        # print(f"Monomial coeffs {self.monomial_coeffs}")
+        # print(f"Tree weights {self.tree_weights}")
 
     def reset_parameters(self):
         nn.init.normal_(self.input_weights, mean=1.0, std=0.05)
-        nn.init.normal_(self.monomial_coeffs, mean=0.0, std=0.8)
-        nn.init.normal_(self.tree_weights, mean=0.0, std=0.8)
+        _init_poly_coeffs_linear_bias(self.monomial_coeffs, self.num_inputs_per_leaf)
+        _init_poly_coeffs_linear_bias(self.tree_weights, self.branch_count)
 
         num_groups = max(1, int(math.ceil(self.in_channels / self.group_size)))
         if self.group_mode == "random":
@@ -436,7 +470,7 @@ class FullPolyConv2d(nn.Module):
             dim=-1,
         )
         leaf_outputs = self._apply_activation(leaf_scores)
-
+        #print(f"Leaf outputs: {leaf_outputs}")
         tree_values = leaf_outputs
         coeff_offset = 0
         while tree_values.shape[-1] > 1:
@@ -900,6 +934,25 @@ class ExampleTrainer:
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
         return train_loader, test_loader
 
+
+    @staticmethod
+    def run_test() -> None:
+        x = torch.randn(1, 1, 2, 2)
+        print(f"Input x: {x}")
+        testM = FullPolyConv2d(
+            in_channels=1,
+            out_channels=1,
+            kernel_size=2,
+            stride=1,   
+            padding=0,
+            input_percent=0.2,
+            branch_count=2, 
+            depth=1,
+            activation="identity",
+            max_selected_features=2
+        )
+        print(f"Output y: {testM(x)}")
+
     @staticmethod
     def run_demo() -> None:
         train_loader, test_loader = ExampleTrainer.make_loaders(batch_size=128, train_limit=20000, test_limit=2000)
@@ -1022,5 +1075,6 @@ class ExampleTrainer:
 
 
 if __name__ == "__main__":
+    #ExampleTrainer.run_test()
     ExampleTrainer.run_cifar10_conv_demo()
     #ExampleTrainer.run_demo()
