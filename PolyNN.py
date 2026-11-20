@@ -197,14 +197,14 @@ class SparsePolyNeuron(nn.Module):
     def top_dominant_inputs(self, k: int = 3) -> torch.Tensor:
         return torch.topk(self.input_weights.abs(), k=min(k, self.in_features)).indices
 
-    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: float = 0.2) -> None:
         with torch.no_grad():
             device = self.input_weights.device
             selected = self.selected_indices
             selected_weights = self.input_weights[selected]
-            negative_positions = torch.nonzero(selected_weights < 0, as_tuple=False).flatten()
+            low_positions = torch.nonzero(selected_weights < replacement_threshold, as_tuple=False).flatten()
 
-            for pos in negative_positions.tolist():
+            for pos in low_positions.tolist():
                 old_idx = int(selected[pos].item())
 
                 available_mask = torch.ones(self.in_features, dtype=torch.bool, device=device)
@@ -304,15 +304,15 @@ class FullPolyLayer(nn.Module):
     def top_dominant_inputs(self, top_k: int = 3) -> torch.Tensor:
         return torch.topk(self.input_weights.abs(), k=min(top_k, self.in_features), dim=1)
 
-    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: float = 0.2) -> None:
         with torch.no_grad():
             device = self.input_weights.device
             for neuron_idx in range(self.out_features):
                 selected = self.selected_indices[neuron_idx]
                 selected_weights = self.input_weights[neuron_idx, selected]
-                negative_positions = torch.nonzero(selected_weights < 0, as_tuple=False).flatten()
+                low_positions = torch.nonzero(selected_weights < replacement_threshold, as_tuple=False).flatten()
 
-                for pos in negative_positions.tolist():
+                for pos in low_positions.tolist():
                     old_idx = int(selected[pos].item())
 
                     available_mask = torch.ones(self.in_features, dtype=torch.bool, device=device)
@@ -593,12 +593,12 @@ class FullPolyConv2d(nn.Module):
     def l1_regularization(self, lambda_value: float) -> torch.Tensor:
         return lambda_value * (torch.abs(self.input_weights).sum() + torch.abs(self.tree_weights).sum())
 
-    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: float = 0.2) -> None:
         with torch.no_grad():
             device = self.input_weights.device
-            negative_positions = torch.nonzero(self.input_weights < 0, as_tuple=False)
+            low_positions = torch.nonzero(self.input_weights < replacement_threshold, as_tuple=False)
 
-            for oc, leaf, inp in negative_positions.tolist():
+            for oc, leaf, inp in low_positions.tolist():
                 group_id = int(self.channel_group_assignments[oc].item())
                 group_start = group_id * self.group_size
                 group_end = min(self.in_channels, group_start + self.group_size)
@@ -653,10 +653,10 @@ class SparsePolyLayer(nn.Module):
     def regularization_loss(self, lambda_value: float) -> torch.Tensor:
         return sum(neuron.l1_regularization(lambda_value) for neuron in self.neurons)
 
-    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: float = 0.2) -> None:
         for neuron in self.neurons:
-            neuron.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
-
+            neuron.replace_negative_inputs(init_mean=init_mean, init_std=init_std, replacement_threshold=replacement_threshold)
+        
 
 class SparsePolynomialNetwork(nn.Module):
     """A simple MLP whose hidden units are sparse polynomial neurons."""
@@ -720,18 +720,10 @@ class SparsePolynomialNetwork(nn.Module):
             total = total + layer.regularization_loss(self.l1_lambda)
         return total
 
-    def prune_top_k(self, top_k: int = 3) -> None:
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: float = 0.2) -> None:
         for layer in self.layers:
-            for neuron in layer.neurons:
-                keep = neuron.top_dominant_inputs(k=top_k)
-                with torch.no_grad():
-                    mask = torch.zeros_like(neuron.input_weights, dtype=torch.bool)
-                    mask[keep] = True
-                    neuron.input_weights.data[~mask] = 0.0
+            layer.replace_negative_inputs(init_mean=init_mean, init_std=init_std, replacement_threshold=replacement_threshold)
 
-    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
-        for layer in self.layers:
-            layer.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
 
 
 class FullPolyNetwork(nn.Module):
@@ -796,9 +788,9 @@ class FullPolyNetwork(nn.Module):
             total = total + layer.l1_regularization(self.l1_lambda)
         return total
 
-    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05) -> None:
+    def replace_negative_inputs(self, init_mean: float = 1.0, init_std: float = 0.05, replacement_threshold: float = 0.2) -> None:
         for layer in self.layers:
-            layer.replace_negative_inputs(init_mean=init_mean, init_std=init_std)
+            layer.replace_negative_inputs(init_mean=init_mean, init_std=init_std, replacement_threshold=replacement_threshold)
 
 
 class ConvPolyNetwork(nn.Module):
